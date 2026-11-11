@@ -9,7 +9,7 @@ You'll build a "Continue watching" backend in Python with gRPC, plus a React/Typ
 **What it does**
 
 - While a video plays, the player streams its position to the server every 5 seconds over one long-lived gRPC client stream.
-- The server keeps the latest position per user and video in Redis, and writes to PostgreSQL in batches every few seconds instead of on every heartbeat.
+- The server keeps the latest position per user and video in Redis, and writes to PostgreSQL in batches every 30 s (and at once on pause, session end, stream close and finishing a video) instead of on every heartbeat.
 - When a user opens the app, they get a "Continue watching" row: unfinished videos sorted by last watched, with a progress bar on each.
 - Videos watched past 90% count as finished and leave the row; the user can also remove a video from it.
 - The same user on two devices resumes from the furthest-recent position: last write wins, compared by event time and not arrival time.
@@ -20,9 +20,32 @@ You'll build a "Continue watching" backend in Python with gRPC, plus a React/Typ
 
 ## Architecture
 
-&#91;embedded content: watch-progress architecture · 2 clients, 1 service, 2 stores\]
+```mermaid
+flowchart TB
+    web["<b>Web player</b><br/>React + TypeScript"]
+    tv["<b>TV simulator / k6</b><br/>Python CLI, load test"]
 
-Both clients write to the same Python gRPC service: the browser through Envoy, the TV simulator directly with client streaming. The "Continue watching" row is read from Redis, falling back to PostgreSQL when the cache is cold.
+    subgraph cloudrun["Cloud Run service"]
+        envoy["<b>Envoy sidecar</b><br/>gRPC-Web to gRPC"]
+        server["<b>gRPC server (Python, grpc.aio)</b><br/>auth interceptor, write-behind flusher"]
+    end
+
+    redis[("<b>Redis (Upstash)</b><br/>hot: latest positions")]
+    pg[("<b>PostgreSQL (Neon)</b><br/>durable: progress table")]
+
+    web -->|"gRPC-Web, unary, every 5 s"| envoy
+    envoy -->|"native gRPC"| server
+    tv -->|"native gRPC, client stream"| server
+    server -->|"latest position (Lua, last-write-wins)"| redis
+    server -->|"batched upsert every 30 s, immediate flush on pause / session end / stream close / finish"| pg
+    server -->|"row query on every Continue-watching request"| pg
+
+    classDef main fill:#e3eefc,stroke:#2b6fd6,stroke-width:2px;
+    class server main
+    style cloudrun fill:none,stroke:#999,stroke-dasharray:5 4
+```
+
+Both clients write to the same Python gRPC service: the browser through Envoy, the TV simulator directly with client streaming. The "Continue watching" row is built on every request by merging Redis (recent, unflushed positions) with a PostgreSQL query; the later event time wins per video.
 
 ## Tech stack and API
 
@@ -33,8 +56,8 @@ One design fact shapes the API: **browsers can't do gRPC client streaming.** gRP
 | API contract | Protocol Buffers, linted with `buf` (lint + breaking-change check) | Google's own style; `buf breaking` shows you understand schema evolution |
 | Server | Python 3.12, `grpcio` with `grpc.aio` (async), `uv` for packages | Standard Google gRPC library; async handles thousands of open streams |
 | Browser bridge | Envoy gRPC-Web filter as a Cloud Run sidecar | Translates browser gRPC-Web into native gRPC. Fallback if Envoy eats too much time: `connectrpc` for Python (beta, v0.11) |
-| Hot storage | Redis: latest position per user and video, plus a "dirty" set for batching | Absorbs heartbeats; one PostgreSQL write per video every few seconds instead of per heartbeat |
-| Durable storage | PostgreSQL via SQLAlchemy 2 (async) + Alembic migrations | Source of truth; `UPSERT … WHERE excluded.event_time > event_time` gives last-write-wins |
+| Hot storage | Redis: latest position per user and video, plus a "dirty" set for batching | Absorbs heartbeats; about one PostgreSQL write per video every 30 s instead of per heartbeat |
+| Durable storage | PostgreSQL via SQLAlchemy 2 (async) + Alembic migrations | Source of truth; `UPSERT … WHERE (excluded.event_time, excluded.session_id) > (event_time, session_id)` gives last-write-wins, with ties broken by `session_id` |
 | Frontend | React + TypeScript + Vite, `@connectrpc/connect-web` with the gRPC-Web transport, TanStack Query | Your strongest area; generated, typed client |
 | Testing | pytest + testcontainers, Playwright, k6 (has gRPC streaming support) | Real numbers for the CV bullet |
 | Delivery | Docker, GitHub Actions, Cloud Run | Google Cloud fits a Google application |
@@ -57,12 +80,22 @@ service WatchProgressService {
   rpc RemoveFromContinueWatching(RemoveFromContinueWatchingRequest) returns (RemoveFromContinueWatchingResponse);
 }
 
+enum ProgressReason {
+  PROGRESS_REASON_UNSPECIFIED = 0;
+  PROGRESS_REASON_PERIODIC = 1;
+  PROGRESS_REASON_PAUSE = 2;       // flushed to PostgreSQL immediately
+  PROGRESS_REASON_SEEK = 3;
+  PROGRESS_REASON_TAB_HIDDEN = 4;
+  PROGRESS_REASON_SESSION_END = 5; // flushed to PostgreSQL immediately
+}
+
+// The duration comes from the videos table, not from the client.
 message ProgressEvent {
   string video_id = 1;
   int32 position_seconds = 2;
-  int32 duration_seconds = 3;
-  google.protobuf.Timestamp client_time = 4; // decides last-write-wins
-  string session_id = 5;                     // one playback session
+  google.protobuf.Timestamp client_time = 3; // decides last-write-wins
+  string session_id = 4;                     // one playback session; breaks ties
+  ProgressReason reason = 5;                 // why the client sent this event
 }
 
 message ReportProgressRequest { ProgressEvent event = 1; }
@@ -80,12 +113,12 @@ message ListContinueWatchingResponse {
 // VideoProgress, Get* and Remove* messages follow the same pattern.
 ```
 
-The user ID comes from the auth metadata (a demo token), never from the request body. That's a security point interviewers like.
+The user ID comes from the auth metadata (a token whose hash maps to a user ID), never from the request body. That's a security point interviewers like.
 
 **Storage model**
 
-- PostgreSQL `watch_progress`: `user_id`, `video_id`, `position_s`, `duration_s`, `event_time`, `finished`, `updated_at`; primary key `(user_id, video_id)`, index on `(user_id, event_time DESC)`.
-- Redis: hash `wp:{user}:{video}` for the latest position; sorted set `cw:{user}` scored by event time for the row; set `wp:dirty` of keys waiting to be flushed. A Lua script makes "compare event time, then write" atomic.
+- PostgreSQL `watch_progress`: `user_id`, `video_id`, `position_s`, `duration_s`, `event_time`, `session_id`, `finished`, `removed`, `updated_at`; primary key `(user_id, video_id)`, partial index on `(user_id, event_time DESC)` for rows that are not finished or removed. `videos` (the catalogue, with the true duration) and `user_tokens` (token hash → user ID) are seeded.
+- Redis: hash `wp:{user}:{video}` for the latest position (no TTL while unflushed, 5 minutes after a successful flush); sorted set `cw:{user}` scored by event time for the row; set `wp:dirty` of keys waiting to be flushed; set `wp:flush-now` of keys to flush ahead of the 30 s tick. A Lua script makes "compare event time, then write" atomic. See `docs/DESIGN.md`.
 
 ## Implementation plan
 
@@ -94,10 +127,10 @@ Eight phases, about 47 hours in total. Each phase ends with something you can ru
 | # | Phase | What you build | Done when | Hours |
 | --- | --- | --- | --- | --- |
 | 0 | Setup and design doc | Repo layout (`proto/`, `server/`, `web/`, `deploy/`), `uv`, `buf`, docker-compose with PostgreSQL and Redis, CLAUDE.md and skills, one-page design doc | `docker compose up` works; design doc committed | 4 |
-| 1 | API and server skeleton | `.proto` file, `buf lint`, `grpc.aio` server with health check and reflection, auth interceptor (demo token → user ID), `ListContinueWatching` read from PostgreSQL | `grpcurl` returns a list from seeded data | 5 |
-| 2 | Write path | `ReportProgress` and `StreamProgress`; Redis Lua script for last-write-wins; write-behind flusher batching upserts to PostgreSQL; ≥90% marks a video finished; deadlines and proper status codes | Integration tests (testcontainers) pass; restarting the server loses at most one flush interval | 8 |
+| 1 | API and server skeleton | `.proto` file, `buf lint`, `grpc.aio` server with health check and reflection, auth interceptor (token hash → user ID from `user_tokens`), `videos` and `user_tokens` seeds, `ListContinueWatching` read from PostgreSQL | `grpcurl` returns a list from seeded data | 5 |
+| 2 | Write path | `ReportProgress` and `StreamProgress`; Redis Lua script for last-write-wins; write-behind flusher batching upserts to PostgreSQL; ≥90% marks a video finished; deadlines and proper status codes | Integration tests (testcontainers) pass; restarting the server loses no acknowledged heartbeat | 8 |
 | 3 | Browser bridge | Envoy gRPC-Web config, CORS, generated TypeScript client (`buf generate` with protobuf-es) | A browser call to `ReportProgress` lands in Redis | 5 |
-| 4 | React player | HTML5 player with 5–10 public-domain videos; reports every 5 s and on pause, seek and tab hide; "Continue watching" row with progress bars and remove; keyboard and screen-reader support | Playwright test: watch on "device A", resume at the same spot on "device B" | 6 |
+| 4 | React player | HTML5 player with 5–10 public-domain videos; reports every 5 s and on pause, seek, tab hide and session end; "Continue watching" row with progress bars and remove; keyboard and screen-reader support | Playwright test: watch on "device A", resume at the same spot on "device B" | 6 |
 | 5 | Device simulator and load test | Python CLI "TV" using client streaming; k6 script opening N streams; measure p99 latency and the heartbeats-to-database-writes ratio; tune batch size | Numbers recorded in the README and the design doc | 6 |
 | 6 | Deploy | Dockerfiles, GitHub Actions (lint, test, `buf breaking`, deploy), Cloud Run with HTTP/2 end-to-end and the Envoy sidecar, managed PostgreSQL and Redis, budget alert | Public demo URL works on your phone | 5 |
 | 7 | Learning pass | Rewrite the Lua script and the flusher by hand; write 15 likely interview questions with your answers (scale to 10M viewers, Redis failure, clock skew, hot keys) | You can explain every trade-off without notes | 8 |

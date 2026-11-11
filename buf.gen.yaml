@@ -1,0 +1,12 @@
+version: v2
+clean: true
+plugins:
+  # Python: messages (_pb2) + gRPC stubs (_pb2_grpc). Remote plugins: need network.
+  - remote: buf.build/protocolbuffers/python
+    out: server/src/watchprogress/gen
+  - remote: buf.build/grpc/python
+    out: server/src/watchprogress/gen
+  # TypeScript: protobuf-es messages + service descriptors, used by connect-web.
+  - remote: buf.build/bufbuild/es
+    out: web/src/gen
+    opt: target=ts
