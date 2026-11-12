@@ -1,3 +1,83 @@
 syntax = "proto3";
 
 package watchprogress.v1;
+
+import "google/protobuf/timestamp.proto";
+
+service WatchProgressService {
+  // Web player: unary, one report every ~5 s and on pause, seek or tab hide.
+  rpc ReportProgress(ReportProgressRequest) returns (ReportProgressResponse);
+  // TV / device path: one long-lived client stream per playback session.
+  // The event type is shared with ReportProgress on purpose (docs/DESIGN.md section 4).
+  // buf:lint:ignore RPC_REQUEST_STANDARD_NAME
+  // buf:lint:ignore RPC_RESPONSE_STANDARD_NAME
+  rpc StreamProgress(stream ProgressEvent) returns (StreamProgressSummary);
+  // Latest position of one video, to resume playback.
+  rpc GetProgress(GetProgressRequest) returns (GetProgressResponse);
+  // The "Continue watching" row: unfinished videos, most recently watched first.
+  rpc ListContinueWatching(ListContinueWatchingRequest) returns (ListContinueWatchingResponse);
+  rpc RemoveFromContinueWatching(RemoveFromContinueWatchingRequest) returns (RemoveFromContinueWatchingResponse);
+}
+
+enum ProgressReason {
+  PROGRESS_REASON_UNSPECIFIED = 0;
+  PROGRESS_REASON_PERIODIC = 1;
+  PROGRESS_REASON_PAUSE = 2; // flushed to PostgreSQL immediately
+  PROGRESS_REASON_SEEK = 3;
+  PROGRESS_REASON_TAB_HIDDEN = 4;
+  PROGRESS_REASON_SESSION_END = 5; // flushed to PostgreSQL immediately
+}
+
+// The duration comes from the videos table, not from the client.
+message ProgressEvent {
+  string video_id = 1;
+  int32 position_seconds = 2;
+  google.protobuf.Timestamp client_time = 3; // decides last-write-wins
+  string session_id = 4; // one playback session; breaks ties
+  ProgressReason reason = 5; // why the client sent this event
+}
+
+message VideoProgress {
+  string video_id = 1;
+  string title = 2;
+  string url = 3;
+  int32 position_seconds = 4;
+  int32 duration_seconds = 5;
+  google.protobuf.Timestamp last_watched = 6; // event time of the latest position
+}
+
+message ReportProgressRequest {
+  ProgressEvent event = 1;
+}
+
+message ReportProgressResponse {}
+
+message StreamProgressSummary {
+  int32 events_accepted = 1;
+}
+
+message GetProgressRequest {
+  string video_id = 1;
+}
+
+message GetProgressResponse {
+  VideoProgress progress = 1;
+}
+
+message ListContinueWatchingRequest {
+  int32 page_size = 1;
+  string page_token = 2; // opaque cursor, AIP-158 style
+}
+
+message ListContinueWatchingResponse {
+  repeated VideoProgress items = 1;
+  string next_page_token = 2;
+}
+
+message RemoveFromContinueWatchingRequest {
+  string video_id = 1;
+  google.protobuf.Timestamp client_time = 2; // ordered against heartbeats like any event
+  string session_id = 3;
+}
+
+message RemoveFromContinueWatchingResponse {}
