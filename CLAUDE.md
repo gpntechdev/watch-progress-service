@@ -20,7 +20,7 @@ A "Continue watching" backend (Python, gRPC, Redis, PostgreSQL) plus a React/Typ
 - Each "Continue watching" request merges Redis (recent, unflushed positions) with a PostgreSQL query; the later event time wins per video. User ID comes from auth metadata, never the request body.
 
 ## Rules
-- Never edit generated code (`server/src/watchprogress/gen/`, `web/src/gen/`); change the `.proto` and run `make gen`.
+- Never edit generated code (`server/src/gen/`, `web/src/gen/`); change the `.proto` and run `make gen`.
 - Every RPC change starts in `proto/watchprogress/v1/watch_progress.proto`.
 - Tests come with every change.
 - **Ask before writing the Redis Lua script, the write-behind flusher or the conflict (last-write-wins) rules.** The owner writes these by hand; Claude may review, explain and write tests for them.
